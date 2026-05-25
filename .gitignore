@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Raw course data. The assignment asks to describe data sources, not submit data.
+daily/
+metric/
+moneyflow/
+news/
+stock_st/
+index_weight/
+market/
+basic.csv
+trade_cal.csv
+
+# Experiment artifacts can be regenerated from the script.
+outputs/
+*.pt
+*.pth
+*.ckpt
