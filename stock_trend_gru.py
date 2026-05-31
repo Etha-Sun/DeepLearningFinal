@@ -77,6 +77,12 @@ def parse_args():
         default="next_open_to_close",
         help="Prediction target. next_open_to_close matches after-close signals with next-day execution.",
     )
+    parser.add_argument(
+        "--label-transform",
+        choices=["raw", "rank", "zscore"],
+        default="raw",
+        help="Transform the training label within each trade date. rank/zscore align training with cross-sectional selection.",
+    )
     parser.add_argument("--model", choices=["gru", "lstm", "mlp", "transformer"], default="gru")
     parser.add_argument("--max-stocks", type=int, default=300)
     parser.add_argument("--max-train-samples", type=int, default=80000)
@@ -90,6 +96,14 @@ def parse_args():
     parser.add_argument("--top-n", type=int, default=10)
     parser.add_argument("--rebalance-k", type=int, default=3)
     parser.add_argument("--transaction-cost-bps", type=float, default=10.0)
+    parser.add_argument(
+        "--min-trade-amount",
+        type=float,
+        default=0.0,
+        help="Minimum signal-day amount, in the raw data unit, for IC/backtest/latest recommendation eligibility.",
+    )
+    parser.add_argument("--min-price", type=float, default=0.0, help="Minimum signal-day close price for eligibility.")
+    parser.add_argument("--max-price", type=float, default=0.0, help="Maximum signal-day close price for eligibility; 0 disables it.")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -241,6 +255,25 @@ def add_features_and_label(panel, horizon):
     return df
 
 
+def add_training_label(df, target, label_transform):
+    data = df.copy()
+    raw_col = f"{target}_return"
+    if label_transform == "raw":
+        data["label"] = data[raw_col]
+    elif label_transform == "rank":
+        counts = data.groupby("trade_date")[raw_col].transform("count")
+        ranks = data.groupby("trade_date")[raw_col].rank(method="average", pct=True)
+        data["label"] = (ranks - 0.5).where(counts > 1)
+    elif label_transform == "zscore":
+        grouped = data.groupby("trade_date")[raw_col]
+        mean = grouped.transform("mean")
+        std = grouped.transform("std").replace(0, np.nan)
+        data["label"] = ((data[raw_col] - mean) / (std + 1e-6)).clip(-5.0, 5.0)
+    else:
+        raise ValueError(f"Unknown label transform: {label_transform}")
+    return data
+
+
 def deterministic_cap(indices, max_samples):
     if max_samples is None or max_samples <= 0 or len(indices) <= max_samples:
         return indices
@@ -250,21 +283,25 @@ def deterministic_cap(indices, max_samples):
 
 def build_windows(df, lookback, train_end, val_start, val_end, max_train, max_val, target):
     xs = []
-    ys = []
+    raw_returns = []
     dates = []
     codes = []
     closes = []
+    amounts = []
+    label_values = []
     close_to_close_returns = []
     executable_returns = []
 
     for code, group in df.groupby("ts_code", sort=False):
         group = group.sort_values("trade_date")
         feat = group[FEATURES].to_numpy(dtype=np.float32)
-        label = group[f"{target}_return"].to_numpy(dtype=np.float32)
+        label = group["label"].to_numpy(dtype=np.float32)
+        raw_return = group[f"{target}_return"].to_numpy(dtype=np.float32)
         close_to_close = group["close_to_close_return"].to_numpy(dtype=np.float32)
         executable_return = group["next_open_to_close_return"].to_numpy(dtype=np.float32)
         date = group["trade_date"].to_numpy(dtype=np.int64)
         close = group["close"].to_numpy(dtype=np.float32)
+        amount = group["amount"].to_numpy(dtype=np.float32)
 
         for i in range(lookback - 1, len(group)):
             if np.isnan(label[i]):
@@ -275,17 +312,21 @@ def build_windows(df, lookback, train_end, val_start, val_end, max_train, max_va
             mean = window.mean(axis=0, keepdims=True)
             std = window.std(axis=0, keepdims=True) + 1e-6
             xs.append((window - mean) / std)
-            ys.append(label[i])
+            raw_returns.append(raw_return[i])
             dates.append(date[i])
             codes.append(code)
             closes.append(close[i])
+            amounts.append(amount[i])
+            label_values.append(label[i])
             close_to_close_returns.append(close_to_close[i])
             executable_returns.append(executable_return[i])
 
     x = np.stack(xs).astype(np.float32)
-    y = np.asarray(ys, dtype=np.float32)
+    y_raw = np.asarray(raw_returns, dtype=np.float32)
+    y_label = np.asarray(label_values, dtype=np.float32)
     dates = np.asarray(dates, dtype=np.int64)
     closes = np.asarray(closes, dtype=np.float32)
+    amounts = np.asarray(amounts, dtype=np.float32)
     close_to_close_returns = np.asarray(close_to_close_returns, dtype=np.float32)
     executable_returns = np.asarray(executable_returns, dtype=np.float32)
     codes = np.asarray(codes)
@@ -300,12 +341,22 @@ def build_windows(df, lookback, train_end, val_start, val_end, max_train, max_va
             "trade_date": dates[eval_idx],
             "ts_code": codes[eval_idx],
             "close": closes[eval_idx],
-            "y_true": y[eval_idx],
+            "amount": amounts[eval_idx],
+            "y_true": y_raw[eval_idx],
+            "y_label": y_label[eval_idx],
             "close_to_close_return": close_to_close_returns[eval_idx],
             "strategy_return": executable_returns[eval_idx],
         }
     )
-    return x[train_idx], y[train_idx], x[val_loss_idx], y[val_loss_idx], x[eval_idx], y[eval_idx], meta
+    return (
+        x[train_idx],
+        y_label[train_idx],
+        x[val_loss_idx],
+        y_label[val_loss_idx],
+        x[eval_idx],
+        y_label[eval_idx],
+        meta,
+    )
 
 
 def build_latest_windows(df, lookback):
@@ -320,7 +371,14 @@ def build_latest_windows(df, lookback):
         std = window.std(axis=0, keepdims=True) + 1e-6
         xs.append((window - mean) / std)
         last = group.iloc[-1]
-        rows.append({"trade_date": int(last["trade_date"]), "ts_code": code, "close": float(last["close"])})
+        rows.append(
+            {
+                "trade_date": int(last["trade_date"]),
+                "ts_code": code,
+                "close": float(last["close"]),
+                "amount": float(last["amount"]),
+            }
+        )
     if not xs:
         raise ValueError("No stocks have enough history for latest inference.")
     return np.stack(xs).astype(np.float32), pd.DataFrame(rows)
@@ -473,6 +531,19 @@ def predict(model, x, device, batch_size):
     return np.concatenate(preds)
 
 
+def mark_eligibility(df, min_trade_amount, min_price, max_price):
+    eligible = pd.Series(True, index=df.index)
+    if min_trade_amount > 0:
+        eligible &= df["amount"] >= min_trade_amount
+    if min_price > 0:
+        eligible &= df["close"] >= min_price
+    if max_price > 0:
+        eligible &= df["close"] <= max_price
+    result = df.copy()
+    result["is_eligible"] = eligible
+    return result
+
+
 def daily_ic(pred_df):
     values = []
     for date, group in pred_df.groupby("trade_date"):
@@ -487,6 +558,29 @@ def daily_ic(pred_df):
     mean = ic["ic"].mean()
     std = ic["ic"].std(ddof=1)
     return ic, {"ic_mean": mean, "ic_std": std, "icir": mean / std if std and not np.isnan(std) else float("nan")}
+
+
+def evaluate_strategy_grid(pred_df, transaction_cost_bps):
+    rows = []
+    for top_n, rebalance_k in [
+        (10, 1),
+        (10, 2),
+        (10, 3),
+        (20, 2),
+        (20, 3),
+        (20, 5),
+        (30, 2),
+        (30, 3),
+        (30, 5),
+        (50, 3),
+        (50, 5),
+        (50, 8),
+    ]:
+        _, metrics = backtest_topk(pred_df, top_n, rebalance_k, transaction_cost_bps)
+        if not metrics:
+            continue
+        rows.append({"top_n": top_n, "rebalance_k": rebalance_k, **metrics})
+    return pd.DataFrame(rows)
 
 
 def backtest_topk(pred_df, top_n, rebalance_k, transaction_cost_bps):
@@ -620,6 +714,7 @@ def main():
     print(f"selected_stocks={len(stock_pool)}")
     panel = load_daily_panel(args.data_dir, stock_pool, args.start_date, args.end_date)
     data = add_features_and_label(panel, args.horizon)
+    data = add_training_label(data, args.target, args.label_transform)
     x_train, y_train, x_val_loss, y_val_loss, x_eval, _y_eval, meta = build_windows(
         data,
         args.lookback,
@@ -641,37 +736,54 @@ def main():
     )
     model, history, device = train_model(args, x_train, y_train, x_val_loss, y_val_loss)
     meta["score"] = predict(model, x_eval, device, args.batch_size)
+    meta = mark_eligibility(meta, args.min_trade_amount, args.min_price, args.max_price)
     meta.to_csv(args.output_dir / "validation_predictions.csv", index=False)
 
-    ic, ic_metrics = daily_ic(meta)
+    eval_meta = meta[meta["is_eligible"]].copy()
+    if eval_meta.empty:
+        raise ValueError("No eligible validation rows. Relax liquidity or price filters.")
+
+    ic, ic_metrics = daily_ic(eval_meta)
     ic.to_csv(args.output_dir / "daily_ic.csv", index=False)
-    direction_acc = (np.sign(meta["score"]) == np.sign(meta["y_true"])).mean()
-    bt, bt_metrics = backtest_topk(meta, args.top_n, args.rebalance_k, args.transaction_cost_bps)
+    direction_acc = (np.sign(eval_meta["score"]) == np.sign(eval_meta["y_true"])).mean()
+    bt, bt_metrics = backtest_topk(eval_meta, args.top_n, args.rebalance_k, args.transaction_cost_bps)
     bt.to_csv(args.output_dir / "backtest.csv", index=False)
+    grid = evaluate_strategy_grid(eval_meta, args.transaction_cost_bps)
+    if not grid.empty:
+        grid.to_csv(args.output_dir / "strategy_grid.csv", index=False)
     bench = benchmark_returns(args.data_dir, "000300.SH", bt["trade_date"] if not bt.empty else [], args.horizon)
     if not bench.empty:
         bench.to_csv(args.output_dir / "benchmark_000300.csv", index=False)
 
     latest_x, latest_meta = build_latest_windows(data, args.lookback)
     latest_meta["score"] = predict(model, latest_x, device, args.batch_size)
-    latest_date, latest = save_latest_recommendations(latest_meta, stock_pool, args.output_dir, args.top_n)
+    latest_meta = mark_eligibility(latest_meta, args.min_trade_amount, args.min_price, args.max_price)
+    latest_date, latest = save_latest_recommendations(
+        latest_meta[latest_meta["is_eligible"]].copy(), stock_pool, args.output_dir, args.top_n
+    )
     plot_outputs(history, bt, bench, args.output_dir)
+    eval_counts = eval_meta.groupby("trade_date")["ts_code"].nunique()
 
     metrics = {
         "args": vars(args) | {"data_dir": str(args.data_dir), "output_dir": str(args.output_dir)},
         "model": args.model,
         "features": FEATURES,
         "target": args.target,
+        "label_transform": args.label_transform,
         "backtest_return": "next_open_to_close_return",
         "transaction_cost_bps": args.transaction_cost_bps,
+        "min_trade_amount": args.min_trade_amount,
+        "min_price": args.min_price,
+        "max_price": args.max_price,
         "train_samples": int(len(x_train)),
-        "val_samples": int(len(x_eval)),
+        "val_samples": int(len(eval_meta)),
         "val_loss_samples": int(len(x_val_loss)),
         "eval_samples": int(len(x_eval)),
-        "eval_days": int(meta["trade_date"].nunique()),
-        "eval_min_stocks_per_day": int(meta.groupby("trade_date")["ts_code"].nunique().min()),
-        "eval_median_stocks_per_day": float(meta.groupby("trade_date")["ts_code"].nunique().median()),
-        "eval_max_stocks_per_day": int(meta.groupby("trade_date")["ts_code"].nunique().max()),
+        "eligible_eval_samples": int(len(eval_meta)),
+        "eval_days": int(eval_meta["trade_date"].nunique()),
+        "eval_min_stocks_per_day": int(eval_counts.min()),
+        "eval_median_stocks_per_day": float(eval_counts.median()),
+        "eval_max_stocks_per_day": int(eval_counts.max()),
         "final_train_loss": history[-1]["train_loss"],
         "final_val_loss": history[-1]["val_loss"],
         "direction_accuracy": float(direction_acc),

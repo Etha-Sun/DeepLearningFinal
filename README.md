@@ -224,6 +224,7 @@ python stock_trend_gru.py \
 - `outputs/gru_daily/validation_predictions.csv`：验证集逐股票预测分数。
 - `outputs/gru_daily/daily_ic.csv`：逐日 IC。
 - `outputs/gru_daily/backtest.csv`：策略净值和持仓。
+- `outputs/gru_daily/strategy_grid.csv`：多组 Top-K / 换仓参数的回测指标。
 - `outputs/gru_daily/benchmark_000300.csv`：沪深 300 基准净值。
 - `outputs/gru_daily/loss_curve.png`：训练/验证损失曲线。
 - `outputs/gru_daily/backtest_nav.png`：策略与基准净值曲线。
@@ -253,6 +254,13 @@ done
 ```
 
 下面表格为一次历史实验记录。当前脚本若重新运行，应以新生成的 `metrics.json`、`backtest.csv` 和图表为准。
+
+脚本还支持以下稳健性实验开关：
+
+- `--label-transform raw|rank|zscore`：原始收益、横截面 rank 标签或横截面 z-score 标签。
+- `--min-trade-amount`、`--min-price`、`--max-price`：按信号日成交额和价格过滤可交易股票。
+
+最近 4 个滚动 10 交易日窗口中，`zscore` 标签相对 `raw` 标签显著改善了 Top-K 回测；`rank` 标签在最后窗口未改善。因此当前推荐优先使用 `--label-transform zscore`，并用 `strategy_grid.csv` 选择换仓参数。
 
 本次 300 股对比结果：
 
