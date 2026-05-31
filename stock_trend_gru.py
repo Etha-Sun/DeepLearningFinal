@@ -1,14 +1,22 @@
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.abspath(".matplotlib-cache"))
+os.environ.setdefault("XDG_CACHE_HOME", os.path.abspath(".cache"))
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 FEATURES = [
@@ -19,6 +27,36 @@ FEATURES = [
     "log_vol",
     "log_amount",
     "turnover_proxy",
+    "turnover_rate",
+    "volume_ratio",
+    "log_circ_mv",
+    "pb",
+    "pe_ttm_pos",
+    "net_mf_ratio",
+    "large_order_net_ratio",
+    "small_order_net_ratio",
+]
+
+METRIC_COLS = [
+    "ts_code",
+    "trade_date",
+    "turnover_rate",
+    "volume_ratio",
+    "pe_ttm",
+    "pb",
+    "circ_mv",
+]
+
+MONEYFLOW_COLS = [
+    "ts_code",
+    "trade_date",
+    "buy_sm_amount",
+    "sell_sm_amount",
+    "buy_lg_amount",
+    "sell_lg_amount",
+    "buy_elg_amount",
+    "sell_elg_amount",
+    "net_mf_amount",
 ]
 
 
@@ -33,6 +71,12 @@ def parse_args():
     parser.add_argument("--val-end", type=int, default=20251231)
     parser.add_argument("--lookback", type=int, default=20)
     parser.add_argument("--horizon", type=int, default=1)
+    parser.add_argument(
+        "--target",
+        choices=["close_to_close", "next_open_to_close"],
+        default="next_open_to_close",
+        help="Prediction target. next_open_to_close matches after-close signals with next-day execution.",
+    )
     parser.add_argument("--model", choices=["gru", "lstm", "mlp", "transformer"], default="gru")
     parser.add_argument("--max-stocks", type=int, default=300)
     parser.add_argument("--max-train-samples", type=int, default=80000)
@@ -45,6 +89,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--top-n", type=int, default=10)
     parser.add_argument("--rebalance-k", type=int, default=3)
+    parser.add_argument("--transaction-cost-bps", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -112,6 +157,14 @@ def load_daily_panel(data_dir, stock_pool, start_date, end_date):
     for date, path in files:
         df = pd.read_csv(path, usecols=cols, dtype={"ts_code": str})
         df = df[df["ts_code"].isin(keep_codes)]
+        metric_path = data_dir / "metric" / f"{date}.csv"
+        if metric_path.exists():
+            metric = pd.read_csv(metric_path, usecols=METRIC_COLS, dtype={"ts_code": str})
+            df = df.merge(metric, on=["ts_code", "trade_date"], how="left")
+        moneyflow_path = data_dir / "moneyflow" / f"{date}.csv"
+        if moneyflow_path.exists():
+            moneyflow = pd.read_csv(moneyflow_path, usecols=MONEYFLOW_COLS, dtype={"ts_code": str})
+            df = df.merge(moneyflow, on=["ts_code", "trade_date"], how="left")
         st_codes = load_st_set(data_dir, date)
         if st_codes:
             df = df[~df["ts_code"].isin(st_codes)]
@@ -125,7 +178,31 @@ def load_daily_panel(data_dir, stock_pool, start_date, end_date):
 
 def add_features_and_label(panel, horizon):
     df = panel.copy()
-    for col in ["open", "high", "low", "close", "pre_close", "vol", "amount", "vwap"]:
+    numeric_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "pre_close",
+        "vol",
+        "amount",
+        "vwap",
+        "turnover_rate",
+        "volume_ratio",
+        "pe_ttm",
+        "pb",
+        "circ_mv",
+        "buy_sm_amount",
+        "sell_sm_amount",
+        "buy_lg_amount",
+        "sell_lg_amount",
+        "buy_elg_amount",
+        "sell_elg_amount",
+        "net_mf_amount",
+    ]
+    for col in numeric_cols:
+        if col not in df.columns:
+            df[col] = np.nan
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["ret_1"] = df["pct_chg"].astype(float) / 100.0
@@ -136,12 +213,30 @@ def add_features_and_label(panel, horizon):
     df["log_amount"] = np.log1p(df["amount"])
     df["turnover_proxy"] = df["amount"] / df["vol"].replace(0, np.nan)
     df["turnover_proxy"] = np.log1p(df["turnover_proxy"])
+    df["log_circ_mv"] = np.log1p(df["circ_mv"].clip(lower=0))
+    df["pe_ttm_pos"] = np.log1p(df["pe_ttm"].clip(lower=0))
+    df["net_mf_ratio"] = df["net_mf_amount"] / df["amount"].replace(0, np.nan)
+    df["large_order_net_ratio"] = (
+        df["buy_lg_amount"]
+        + df["buy_elg_amount"]
+        - df["sell_lg_amount"]
+        - df["sell_elg_amount"]
+    ) / df["amount"].replace(0, np.nan)
+    df["small_order_net_ratio"] = (df["buy_sm_amount"] - df["sell_sm_amount"]) / df[
+        "amount"
+    ].replace(0, np.nan)
 
-    future_close = df.groupby("ts_code")["close"].shift(-horizon)
-    df["label"] = future_close / df["close"] - 1.0
+    grouped = df.groupby("ts_code")
+    future_close = grouped["close"].shift(-horizon)
+    next_open = grouped["open"].shift(-1)
+    df["close_to_close_return"] = future_close / df["close"] - 1.0
+    df["next_open_to_close_return"] = future_close / next_open - 1.0
 
-    needed = FEATURES + ["close"]
     df = df.replace([np.inf, -np.inf], np.nan)
+    for col in FEATURES:
+        df[col] = df[col].fillna(df.groupby("trade_date")[col].transform("median"))
+    df[FEATURES] = df[FEATURES].fillna(0.0)
+    needed = FEATURES + ["close"]
     df = df.dropna(subset=needed)
     return df
 
@@ -153,22 +248,28 @@ def deterministic_cap(indices, max_samples):
     return indices[positions]
 
 
-def build_windows(df, lookback, train_end, val_start, val_end, max_train, max_val):
+def build_windows(df, lookback, train_end, val_start, val_end, max_train, max_val, target):
     xs = []
     ys = []
     dates = []
     codes = []
     closes = []
+    close_to_close_returns = []
+    executable_returns = []
 
     for code, group in df.groupby("ts_code", sort=False):
         group = group.sort_values("trade_date")
         feat = group[FEATURES].to_numpy(dtype=np.float32)
-        label = group["label"].to_numpy(dtype=np.float32)
+        label = group[f"{target}_return"].to_numpy(dtype=np.float32)
+        close_to_close = group["close_to_close_return"].to_numpy(dtype=np.float32)
+        executable_return = group["next_open_to_close_return"].to_numpy(dtype=np.float32)
         date = group["trade_date"].to_numpy(dtype=np.int64)
         close = group["close"].to_numpy(dtype=np.float32)
 
         for i in range(lookback - 1, len(group)):
             if np.isnan(label[i]):
+                continue
+            if np.isnan(executable_return[i]):
                 continue
             window = feat[i - lookback + 1 : i + 1]
             mean = window.mean(axis=0, keepdims=True)
@@ -178,27 +279,33 @@ def build_windows(df, lookback, train_end, val_start, val_end, max_train, max_va
             dates.append(date[i])
             codes.append(code)
             closes.append(close[i])
+            close_to_close_returns.append(close_to_close[i])
+            executable_returns.append(executable_return[i])
 
     x = np.stack(xs).astype(np.float32)
     y = np.asarray(ys, dtype=np.float32)
     dates = np.asarray(dates, dtype=np.int64)
     closes = np.asarray(closes, dtype=np.float32)
+    close_to_close_returns = np.asarray(close_to_close_returns, dtype=np.float32)
+    executable_returns = np.asarray(executable_returns, dtype=np.float32)
     codes = np.asarray(codes)
 
     train_idx = np.where(dates <= train_end)[0]
-    val_idx = np.where((dates >= val_start) & (dates <= val_end))[0]
+    eval_idx = np.where((dates >= val_start) & (dates <= val_end))[0]
     train_idx = deterministic_cap(train_idx, max_train)
-    val_idx = deterministic_cap(val_idx, max_val)
+    val_loss_idx = deterministic_cap(eval_idx, max_val)
 
     meta = pd.DataFrame(
         {
-            "trade_date": dates[val_idx],
-            "ts_code": codes[val_idx],
-            "close": closes[val_idx],
-            "y_true": y[val_idx],
+            "trade_date": dates[eval_idx],
+            "ts_code": codes[eval_idx],
+            "close": closes[eval_idx],
+            "y_true": y[eval_idx],
+            "close_to_close_return": close_to_close_returns[eval_idx],
+            "strategy_return": executable_returns[eval_idx],
         }
     )
-    return x[train_idx], y[train_idx], x[val_idx], y[val_idx], meta
+    return x[train_idx], y[train_idx], x[val_loss_idx], y[val_loss_idx], x[eval_idx], y[eval_idx], meta
 
 
 def build_latest_windows(df, lookback):
@@ -382,17 +489,20 @@ def daily_ic(pred_df):
     return ic, {"ic_mean": mean, "ic_std": std, "icir": mean / std if std and not np.isnan(std) else float("nan")}
 
 
-def backtest_topk(pred_df, top_n, rebalance_k):
+def backtest_topk(pred_df, top_n, rebalance_k, transaction_cost_bps):
     portfolio = []
     rows = []
+    one_way_cost = transaction_cost_bps / 10000.0
     for date, day in pred_df.sort_values("trade_date").groupby("trade_date", sort=True):
-        day = day.dropna(subset=["score", "y_true"]).sort_values("score", ascending=False)
+        day = day.dropna(subset=["score", "strategy_return"]).sort_values("score", ascending=False)
         available = list(day["ts_code"])
         if not available:
             continue
 
+        old_portfolio = list(portfolio)
         if not portfolio:
             portfolio = available[:top_n]
+            traded_names = len(portfolio)
         else:
             score_map = day.set_index("ts_code")["score"].to_dict()
             held_with_scores = [(code, score_map.get(code, -np.inf)) for code in portfolio]
@@ -401,22 +511,32 @@ def backtest_topk(pred_df, top_n, rebalance_k):
                 for code, _ in sorted(held_with_scores, key=lambda item: item[1])[:rebalance_k]
             }
             portfolio = [code for code in portfolio if code not in sell and code in set(available)]
+            before_buy = set(portfolio)
             for code in available:
                 if len(portfolio) >= top_n:
                     break
                 if code not in portfolio:
                     portfolio.append(code)
+            bought = set(portfolio) - before_buy
+            traded_names = len(sell) + len(bought)
 
         held = day[day["ts_code"].isin(portfolio)]
         if held.empty:
             continue
-        ret = held["y_true"].mean()
+        gross_ret = held["strategy_return"].mean()
+        turnover = traded_names / max(1, top_n)
+        cost = turnover * one_way_cost
+        ret = gross_ret - cost
         rows.append(
             {
                 "trade_date": date,
+                "gross_return": gross_ret,
+                "transaction_cost": cost,
+                "turnover": turnover,
                 "daily_return": ret,
                 "nav": np.nan,
                 "holdings": ",".join(portfolio),
+                "prev_holdings": ",".join(old_portfolio),
             }
         )
 
@@ -434,19 +554,23 @@ def backtest_topk(pred_df, top_n, rebalance_k):
         "annual_return": annual_return,
         "sharpe": sharpe,
         "max_drawdown": drawdown.min(),
+        "avg_turnover": bt["turnover"].mean(),
+        "total_transaction_cost": bt["transaction_cost"].sum(),
         "days": int(len(bt)),
     }
     return bt, metrics
 
 
-def benchmark_returns(data_dir, index_code, dates):
+def benchmark_returns(data_dir, index_code, dates, horizon):
     path = data_dir / "market" / f"{index_code}.csv"
     if not path.exists():
         return pd.DataFrame()
     df = pd.read_csv(path)
     df["trade_date"] = df["trade_date"].astype(int)
     df = df.sort_values("trade_date")
-    df["daily_return"] = df["close"].shift(-1) / df["close"] - 1.0
+    entry_open = df["open"].shift(-1)
+    exit_close = df["close"].shift(-horizon)
+    df["daily_return"] = exit_close / entry_open - 1.0
     bench = df[df["trade_date"].isin(set(dates))][["trade_date", "daily_return"]].dropna()
     bench["nav"] = (1.0 + bench["daily_return"]).cumprod()
     return bench
@@ -496,7 +620,7 @@ def main():
     print(f"selected_stocks={len(stock_pool)}")
     panel = load_daily_panel(args.data_dir, stock_pool, args.start_date, args.end_date)
     data = add_features_and_label(panel, args.horizon)
-    x_train, y_train, x_val, y_val, meta = build_windows(
+    x_train, y_train, x_val_loss, y_val_loss, x_eval, _y_eval, meta = build_windows(
         data,
         args.lookback,
         args.train_end,
@@ -504,21 +628,27 @@ def main():
         args.val_end,
         args.max_train_samples,
         args.max_val_samples,
+        args.target,
     )
-    if len(x_train) == 0 or len(x_val) == 0:
+    if len(x_train) == 0 or len(x_val_loss) == 0 or len(x_eval) == 0:
         raise ValueError("Empty train or validation set. Check date ranges and stock pool.")
 
-    print(f"train_samples={len(x_train)} val_samples={len(x_val)} features={len(FEATURES)}")
-    model, history, device = train_model(args, x_train, y_train, x_val, y_val)
-    meta["score"] = predict(model, x_val, device, args.batch_size)
+    print(
+        f"train_samples={len(x_train)} "
+        f"val_loss_samples={len(x_val_loss)} "
+        f"eval_samples={len(x_eval)} "
+        f"features={len(FEATURES)}"
+    )
+    model, history, device = train_model(args, x_train, y_train, x_val_loss, y_val_loss)
+    meta["score"] = predict(model, x_eval, device, args.batch_size)
     meta.to_csv(args.output_dir / "validation_predictions.csv", index=False)
 
     ic, ic_metrics = daily_ic(meta)
     ic.to_csv(args.output_dir / "daily_ic.csv", index=False)
     direction_acc = (np.sign(meta["score"]) == np.sign(meta["y_true"])).mean()
-    bt, bt_metrics = backtest_topk(meta, args.top_n, args.rebalance_k)
+    bt, bt_metrics = backtest_topk(meta, args.top_n, args.rebalance_k, args.transaction_cost_bps)
     bt.to_csv(args.output_dir / "backtest.csv", index=False)
-    bench = benchmark_returns(args.data_dir, "000300.SH", bt["trade_date"] if not bt.empty else [])
+    bench = benchmark_returns(args.data_dir, "000300.SH", bt["trade_date"] if not bt.empty else [], args.horizon)
     if not bench.empty:
         bench.to_csv(args.output_dir / "benchmark_000300.csv", index=False)
 
@@ -531,8 +661,17 @@ def main():
         "args": vars(args) | {"data_dir": str(args.data_dir), "output_dir": str(args.output_dir)},
         "model": args.model,
         "features": FEATURES,
+        "target": args.target,
+        "backtest_return": "next_open_to_close_return",
+        "transaction_cost_bps": args.transaction_cost_bps,
         "train_samples": int(len(x_train)),
-        "val_samples": int(len(x_val)),
+        "val_samples": int(len(x_eval)),
+        "val_loss_samples": int(len(x_val_loss)),
+        "eval_samples": int(len(x_eval)),
+        "eval_days": int(meta["trade_date"].nunique()),
+        "eval_min_stocks_per_day": int(meta.groupby("trade_date")["ts_code"].nunique().min()),
+        "eval_median_stocks_per_day": float(meta.groupby("trade_date")["ts_code"].nunique().median()),
+        "eval_max_stocks_per_day": int(meta.groupby("trade_date")["ts_code"].nunique().max()),
         "final_train_loss": history[-1]["train_loss"],
         "final_val_loss": history[-1]["val_loss"],
         "direction_accuracy": float(direction_acc),

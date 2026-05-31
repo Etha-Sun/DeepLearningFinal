@@ -184,11 +184,11 @@
 
 本仓库新增 `stock_trend_gru.py`，用于完成“基于深度学习的股票趋势预测与模拟交易”的最小可复现实验流程。脚本支持 `gru`、`lstm`、`mlp`、`transformer` 四种神经网络模型：
 
-1. 读取 `daily/` 日频量价数据、`basic.csv` 股票基础信息和 `stock_st/` 风险警示股票列表。
+1. 读取 `daily/` 日频量价数据、`basic.csv` 股票基础信息、`metric/` 基本面指标、`moneyflow/` 资金流向和 `stock_st/` 风险警示股票列表。
 2. 过滤北交所和 ST 股票，默认选择 300 只上市时间较早的 A 股作为股票池。
-3. 用过去 20 个交易日的量价特征预测下一交易日收盘到收盘收益率。
-4. 训练 GRU 回归模型，输出验证集 MSE、IC、ICIR、方向胜率。
-5. 用“持有 10 只、每日替换 3 只低分股”的规则做历史回测，并与沪深 300 对比。
+3. 用过去 20 个交易日的量价、基本面和资金流特征预测下一交易日开盘到收盘收益率，匹配盘后生成信号、次日执行的比赛流程。
+4. 训练 GRU 回归模型，输出验证损失、全量验证集 IC、ICIR、方向胜率。
+5. 用“持有 10 只、每日替换 3 只低分股”的规则做历史回测，计入简化交易成本，并与沪深 300 对比。
 6. 对最新可用交易日生成下一交易日候选买入列表。
 
 安装依赖：
@@ -215,6 +215,8 @@ python stock_trend_gru.py \
   --rebalance-k 3 \
   --output-dir outputs/gru_daily
 ```
+
+其中 `--max-val-samples` 只限制训练过程中计算验证损失的样本量；`validation_predictions.csv`、`daily_ic.csv` 和回测默认使用完整验证区间样本，避免在截断股票池上评估。
 
 主要输出：
 
@@ -249,6 +251,8 @@ for m in gru lstm mlp transformer; do
     --output-dir outputs/model_compare_$m
 done
 ```
+
+下面表格为一次历史实验记录。当前脚本若重新运行，应以新生成的 `metrics.json`、`backtest.csv` 和图表为准。
 
 本次 300 股对比结果：
 

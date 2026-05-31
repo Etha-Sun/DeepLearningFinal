@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.cache/
+.matplotlib-cache/
 
 # Raw course data. The assignment asks to describe data sources, not submit data.
 daily/
